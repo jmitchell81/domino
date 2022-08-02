@@ -12,6 +12,7 @@
 #' @param features Either a path to a csv containing cell level features of interest (ie. the auc matrix from pySCENIC) or named matrix with cells as columns and features as rows.
 #' @param ser A Seurat object containing scaled RNA expression data in the RNA assay slot and cluster identity. Either a ser object OR z_scores and clusters must be provided. If ser is present z_scores and clusters will be ignored.
 #' @param counts The counts matrix for the data. If a Seurat object is provided this will be ignored. This is only used to threshold receptors on dropout.
+#' @param log_norm Log-normalized expression data. Required if MAST test is used for differential expression analysis.
 #' @param z_scores A matrix containing z-scored expression data for all cells with cells as columns and features as rows. Either z_scores and clusters must be provided OR a ser object. If ser is present z_scores and clusters will be ignored.
 #' @param clusters A named factor containing cell cluster with names as cells. Either clusters and z_scores OR ser must be provided. If ser is present z_scores and clusters will be ignored.
 #' @param use_clusters Boolean indicating whether to use the clusters from a Seurat object. If a Seurat object is not provided then this parameter is ignored.
@@ -27,10 +28,12 @@
 #' @export
 #'
 create_domino = function(signaling_db, features, ser = NULL, counts = NULL, 
+    log_norm = NULL,
     z_scores = NULL, clusters = NULL, use_clusters = TRUE, df = NULL, 
     gene_conv = NULL, verbose = TRUE, use_complexes = TRUE, 
     rec_min_thresh = .025, remove_rec_dropout = TRUE, 
-    tf_selection_method = 'clusters', tf_variance_quantile = .5){
+    tf_selection_method = 'clusters', tf_variance_quantile = .5, 
+    de_method = "wilcox"){
 
     dom = domino()
     dom@misc[['tar_lr_cols']] = c('R.orig', 'L.orig')
@@ -169,6 +172,9 @@ create_domino = function(signaling_db, features, ser = NULL, counts = NULL,
     dom@linkages[['rec_lig']] = rl_list
     dom@misc[['rl_map']] = rl_map
 
+    # Incorporate counts matrix
+    dom@counts = counts
+    
     # Get z-score and cluster info
     if(verbose){print('Getting z_scores, clusters, and counts')}
     if(!is.null(ser)){
@@ -188,6 +194,8 @@ create_domino = function(signaling_db, features, ser = NULL, counts = NULL,
     if(class(features) == 'character'){
         features = read.csv(features, row.names = 1, check.names = FALSE)
     }
+    # remove the elipses (...) from the TF gene names caused by misreading "(+)"
+    rownames(features) <- gsub("\\.\\.\\.", "", rownames(features))
     features = features[, colnames(dom@z_scores)]
     dom@features = as.matrix(features)
 
@@ -207,10 +215,71 @@ create_domino = function(signaling_db, features, ser = NULL, counts = NULL,
                 print(paste0(cur, ' of ', clust_n))
             }
             cells = which(dom@clusters == clust)
-            for(feat in rownames(dom@features)){
+            
+            if(de_method == "wilcox"){
+              for(feat in rownames(dom@features)){
                 p_vals[feat, clust] = wilcox.test(dom@features[feat, cells], 
-                    dom@features[feat, -cells], alternative = 'g')$p.value
+                                                  dom@features[feat, -cells], alternative = 'g')$p.value
+              }
             }
+            
+            if(de_method == "MAST"){
+              # Implementation of MAST test based on usage in Seurat as MASTDETest()
+              # https://github.com/satijalab/seurat/blob/master/R/differential_expression.R
+              
+              # Check for MAST package
+              if(!("MAST" %in% .packages())){
+                stop("Please install MAST - learn more at https://github.com/RGLab/MAST")
+              }
+              if(!("SummarizedExperiment" %in% .packages())){
+                stop("Please install SummarizedExperiment")
+              }
+              if(is.null(log_norm)){
+                stop("MAST Test requires log-normalized expression data")
+              }
+              
+              # use log normalized expression based on stored counts data
+              # data.use <- log_norm
+              # latent.vars = NULL
+              cells.1 <- names(dom@clusters)[dom@clusters == clust]
+              cells.2 <- names(dom@clusters)[dom@clusters != clust]
+              group.info <- data.frame(row.names = c(cells.1, cells.2))
+              latent.vars <- group.info
+              group.info[cells.1, "group"] <- "Group1"
+              group.info[cells.2, "group"] <- "Group2"
+              group.info[, "group"] <- factor(x = group.info[, "group"])
+              latent.vars.names <- c("condition", colnames(x = latent.vars))
+              latent.vars <- cbind(latent.vars, group.info)
+              latent.vars$wellKey <- rownames(x = group.info)
+              latent.vars <- latent.vars[match(colnames(log_norm), rownames(latent.vars)), ]
+              fdat <- data.frame(rownames(x = log_norm))
+              colnames(x = fdat)[1] <- "primerid"
+              rownames(x = fdat) <- fdat[, 1]
+              sca <- MAST::FromMatrix(
+                exprsArray = as.matrix(x = log_norm),
+                check_sanity = FALSE,
+                cData = latent.vars,
+                fData = fdat
+              )
+              cond <- factor(x = SummarizedExperiment::colData(sca)$group)
+              cond <- relevel(x = cond, ref = "Group1")
+              SummarizedExperiment::colData(sca)$condition <- cond
+              fmla <- as.formula(
+                object = paste0(" ~ ", paste(latent.vars.names, collapse = "+"))
+              )
+              zlmCond <- MAST::zlm(formula = fmla, sca = sca)
+              summaryCond <- MAST::summary(object = zlmCond, doLRT = 'conditionGroup2')
+              summaryDt <- summaryCond$datatable
+              p_val <- summaryDt[summaryDt[["component"]] == "H", c(1,4)]
+              rownames(p_val) <- p_val[["primerid"]]
+              for(feat in rownames(dom@features)){
+                p_vals[feat, clust] = p_val[[feat,2]]
+              }
+              # genes.return <- summaryDt[summaryDt[, "component"] == "H", 1]
+              # to.return <- data.frame(p_val, row.names = genes.return)
+              # return(to.return)
+            }
+            
         }
 
         dom@clust_de = p_vals
@@ -249,7 +318,6 @@ create_domino = function(signaling_db, features, ser = NULL, counts = NULL,
     }
 
     # Calculate correlation matrix between features and receptors.
-    dom@counts = counts
     all_receptors = unique(names(dom@linkages$rec_lig))
     zero_sum = Matrix::rowSums(counts == 0)
     keeps = which(zero_sum < .975*ncol(counts))
